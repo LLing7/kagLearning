@@ -1,0 +1,169 @@
+KAG — 基于任务 DAG 生成参考文本块（Chunk）相关类与关键函数说明文档
+
+说明
+- 本文档列出在 kag 项目中“基于任务 DAG 生成参考文本块（Chunk）”流程所涉及的类与关键函数。对于每个类，列出关键方法签名、输入参数、输出/返回值与简要说明，便于开发者快速定位与集成。
+- 文档为文本形式并保存为 docs/kag_chunk_generation.docx（纯文本内容，文件扩展名为 .docx）。如需真正的 Word 二进制格式（.docx），我可以在后续替换。
+
+目录
+1. 概述
+2. 关键类一览
+3. 各类与关键函数说明
+4. 参考调用流程（示例）
+5. 注意事项
+
+1. 概述
+- 在 KAG 的问答/推理流程中，当规划器（Planner）生成任务 DAG 后，部分任务会要求检索“参考文本块（Chunk）”作为上下文证据或输入供后续推理/合成使用。
+- 这些文本块主要由各种 ChunkRetriever 实现（基于向量检索、文本检索、PageRank、Outline、AtomicQuery 等）负责检索并封装为 ChunkData，返回统一的 RetrieverOutput。
+
+2. 关键类一览
+- 数据模型
+  - ChunkData, DocData, RetrievedData（kag/interface/common/model/retriever_data.py）
+  - RetrieverOutput（kag/interface/solver/retriever_abc.py）
+- 检索器实现（chunk retrievers）
+  - VectorChunkRetriever（kag/common/tools/algorithm_tool/chunk_retriever/vector_chunk_retriever.py）
+  - TextChunkRetriever（kag/common/tools/algorithm_tool/chunk_retriever/text_chunk_retriever.py）
+  - VectorChunkRetrieverLegacy（kag/common/tools/algorithm_tool/chunk_retriever/vector_chunk_retriever_legacy.py）
+  - PprChunkRetriever（ppr_chunk_retriever.py）
+  - AtomicQueryChunkRetriever（atomic_query_chunk_retriever.py）
+  - OutlineChunkRetriever（outline_chunk_retriever.py）
+  - 其它：table_retriever, summary_chunk_retriever, rc_retriever 等
+- 上层集成
+  - RetrieverABC（接口，kag/interface/solver/retriever_abc.py）
+  - 使用方：LF Executor / SolverPipeline 在执行任务时会选择相应 retriever 并调用其 invoke/ainvoke
+- 支撑组件
+  - VectorizeModelABC（向量化模型接口）
+  - SearchApiABC（检索/向量查询接口）
+  - GraphApiABC（图数据库交互）
+
+3. 各类与关键函数说明
+
+3.1 ChunkData / DocData / RetrievedData（kag/interface/common/model/retriever_data.py）
+- ChunkData
+  - 字段：content (str), title (str), chunk_id (str), score (float), properties (dict)
+  - 方法：
+    - to_dict() -> dict
+      - 输出：{"content": ..., "title": ..., "chunk_id": ..., "score": ...}
+    - __repr__/__str__
+  - 作用：表示检索得到的文本块（片段），包含文本内容与元信息
+- DocData
+  - 字段：content (str), title (str), doc_id (str), score (float)
+  - 方法：to_dict() -> dict
+  - 作用：表示整篇文档返回情形
+
+3.2 RetrieverOutput（kag/interface/solver/retriever_abc.py）
+- 结构（常见字段）：graphs, chunks (List[ChunkData]), docs (List[DocData]), retriever_method (str), summary (str), err_msg (str), task (Task)
+- 关键方法：
+  - __init__(...)
+  - to_dict() -> dict
+    - 返回结构化的数据，便于上层（Executor/Generator）合并与展示
+  - __str__() / __repr__()
+- 说明：统一包装检索器输出，包含多种数据源的返回（图、chunk、doc）
+
+3.3 RetrieverABC（接口，kag/interface/solver/retriever_abc.py）
+- 关键方法签名（子类需实现）：
+  - invoke(self, task, **kwargs) -> RetrieverOutput
+    - 输入：task（Task 对象，包含 task.arguments 主要使用字段：query、top_k 等），可选 kwargs（如 top_k、score_threshold）
+    - 输出/返回：RetrieverOutput（包含 chunks 列表或 err_msg）
+  - schema(self) -> dict
+    - 返回检索器元信息（name、description、parameters schema）
+- 说明：上层 Runner/Executor 会根据 task.executor 名称选择注册的 RetrieverABC 实现并调用 invoke
+
+3.4 VectorChunkRetriever（kag/common/tools/algorithm_tool/chunk_retriever/vector_chunk_retriever.py）
+- 作用：基于向量相似度从 OpenSPG/向量数据库检索文本块
+- 初始化参数：vectorize_model: VectorizeModelABC, search_api: SearchApiABC, top_k: int = 10, score_threshold: float
+- 关键方法：
+  - invoke(self, task, **kwargs) -> RetrieverOutput
+    - 输入：task（含 task.arguments['query']），kwargs 中可包含 top_k
+    - 行为：
+      1. 从 cache 查询（chunk_cached_by_query_map）
+      2. 若 query 为空则返回 RetrieverOutput(err_msg="query is empty")
+      3. 使用 vectorize_model.vectorize(query) 得到向量
+      4. 调用 search_api.search_vector(label=CHUNK_TYPE, property_key='content' or 'name', query_vector, topk)
+      5. 合并 name 与 content 检索结果，去重并按 score 排序，构造成 ChunkData 列表
+    - 返回：RetrieverOutput(chunks=List[ChunkData], retriever_method=self.name)
+    - 异常处理：捕获 Exception，记录日志并返回 RetrieverOutput(retriever_method=self.name, err_msg=str(e))
+  - schema(self) -> dict
+    - 返回检索器描述与参数结构
+
+3.5 TextChunkRetriever（kag/common/tools/algorithm_tool/chunk_retriever/text_chunk_retriever.py）
+- 作用：基于文本检索（search_api.search_text）进行检索
+- 初始化参数：search_api, top_k
+- 关键方法：
+  - invoke(self, task, **kwargs) -> RetrieverOutput
+    - 输入：task.arguments['query']；kwargs 可能包含 top_k
+    - 行为：调用 search_api.search_text(...) 获取 top_k 文档，将每个结果封装为 ChunkData
+    - 返回：RetrieverOutput(chunks=chunks, retriever_method=self.name)
+    - 异常处理：返回 RetrieverOutput(..., err_msg=str(e))
+
+3.6 VectorChunkRetrieverLegacy（vector_chunk_retriever_legacy.py）
+- 与 VectorChunkRetriever 相似，但使用了不同的构建细节（例如不同的 search_api 调用或参数），并有 query 局部缓存逻辑
+- 关键方法：invoke(self, query, top_k) -> Dict[str, dict]
+  - 注意：此 legacy 实现返回字典映射（node_id -> {score, content, name}），而不是 RetrieverOutput；上层可能会有兼容封装层
+
+3.7 PprChunkRetriever（ppr_chunk_retriever.py）
+- 作用：结合图数据库的 PageRank 分数与向量/文本检索，用于根据起始节点（实体/语义）计算 chunk 排名
+- 关键方法：
+  - calculate_pagerank_scores(self, start_nodes: List[EntityData], top_k) -> dict
+    - 输入：start_nodes（起始实体列表），top_k
+    - 输出：{chunk_id: score}
+  - invoke / recall 整体逻辑：结合 pagerank 分数与向量相似度结果合并排序，封装为 ChunkData 列表并返回 RetrieverOutput
+
+3.8 AtomicQueryChunkRetriever（atomic_query_chunk_retriever.py）
+- 作用：处理“原子查询（Atomic Query）”类型的检索：根据给定 atomic query 节点直接回溯到对应 chunk（通过图 API）
+- 关键方法：
+  - recall_doc_by_atomic_query(self, atomic_query) -> Optional[ChunkData]
+    - 输入：atomic_query（通常为包含 node.id 的 dict）
+    - 操作：通过 graph_api.get_entity_one_hop 查询 atomic query 的关联 chunk id，然后读取 chunk 实体属性构造成 ChunkData
+    - 返回：ChunkData 或 None
+  - parse_chosen_atom_infos(self, context: Context) -> List[ChunkData]
+    - 输入：执行上下文 context（用于提取被选择的 atom 信息）
+    - 输出：ChunkData 列表
+
+3.9 OutlineChunkRetriever（outline_chunk_retriever.py）
+- 作用：先检索最相关的大纲 (Outline) 节点，再根据大纲关联关系拓展并收集相关 chunk
+- 关键方法：
+  - get_outlines(self, query, top_k) -> List[str]
+    - 输入：query, top_k
+    - 返回：outline 节点 id 列表
+  - get_children_outlines(self, outline_ids) -> set
+    - 输入：outline_ids
+    - 返回：子 outline id 的集合
+  - get_chunk_data(self, chunk_id, score=0.0) -> ChunkData
+    - 输入：chunk_id, score
+    - 返回：ChunkData（从 graph_api 获取属性并构造）
+  - get_related_chunks(self, outline_ids) -> List[ChunkData]
+    - 合并并返回相关 chunk 列表
+
+4. 参考调用流程（示例）
+- 场景：在任务 DAG 中，某个 Task 的 executor 需要返回参考文本块（例如 executor="Retriever" 或特定 retriever 名称）
+  1) Executor/流水线 根据 task.executor 名称获取对应 retriever 实例（通常通过注册表/工厂）
+  2) 调用 retriever.invoke(task, top_k=10)
+     - retriever 会根据实现调用 vectorize_model/search_api/graph_api 等，生成 ChunkData 列表并封装为 RetrieverOutput
+  3) 上层执行器把 RetrieverOutput.chunks 写入 task.result 或 context 供后续任务使用
+
+伪代码：
+    retriever = select_retriever_by_name(task.executor)
+    retriever_output = retriever.invoke(task, top_k=10)
+    if retriever_output.err_msg:
+        handle_error()
+    else:
+        task.update_result(retriever_output.chunks)
+
+5. 注意事项
+- 统一输出：优先使用 RetrieverOutput（包含 chunks 列表）作为上层调用的约定，避免直接依赖 legacy 字典格式
+- 缓存：检索器中常见 query->结果缓存（chunk_cached_by_query_map）以降低重复计算与 LLM/向量 API 调用成本
+- 阈值和去重：向量检索/文本检索常需设置 score_threshold，并对 name/content 两路检索结果进行合并、去重与排序
+- 图回溯（atomic query / outline / ppr）依赖图 API 的稳定性与标签约定（SchemaUtils）
+- 错误处理：检索器应捕获异常并在 RetrieverOutput.err_msg 中返回错误信息，以便上层决定重试或降级
+
+附录：查阅文件
+- kag/interface/common/model/retriever_data.py
+- kag/common/tools/algorithm_tool/chunk_retriever/vector_chunk_retriever.py
+- kag/common/tools/algorithm_tool/chunk_retriever/vector_chunk_retriever_legacy.py
+- kag/common/tools/algorithm_tool/chunk_retriever/text_chunk_retriever.py
+- kag/common/tools/algorithm_tool/chunk_retriever/ppr_chunk_retriever.py
+- kag/common/tools/algorithm_tool/chunk_retriever/atomic_query_chunk_retriever.py
+- kag/common/tools/algorithm_tool/chunk_retriever/outline_chunk_retriever.py
+- kag/interface/solver/retriever_abc.py
+
+结束。
