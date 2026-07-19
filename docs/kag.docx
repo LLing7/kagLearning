@@ -1,0 +1,110 @@
+KAG 任务 DAG 相关类及关键函数说明（简要）
+
+说明：
+- 本文档列出与“生成任务 DAG / 执行任务 DAG”相关的核心类与关键函数，包含函数签名、输入参数、输出与返回值说明，便于快速定位与使用。
+- 文档为简要版；若需更详细示例或流程图可在后续补充。
+
+目标文件：docs/kag.docx
+
+1. Task（位于 kag/interface/solver/planner_abc.py）
+- 说明：表示单个执行任务，支持父子关系的构建与序列化。
+- 关键方法：
+  - create_tasks_from_dag(task_dag: Dict[str, dict]) -> List[Task]
+    - 输入：task_dag - 字典形式的 DAG 定义，键为任务 ID，值包含 executor、dependent_task_ids、arguments 等。
+    - 输出：List[Task] - 根据 DAG 创建的 Task 对象列表，父/子关系已建立。
+    - 返回值说明：成功返回 Task 列表；若 DAG 格式错误会抛出 ValueError 或 TypeError。
+
+2. PlannerABC（位于 kag/interface/solver/planner_abc.py）
+- 说明：规划器抽象基类，负责从查询生成任务 DAG（Task 列表）。
+- 核心属性/方法：
+  - input_types -> str
+  - output_types -> List[Task]
+  - invoke(query, **kwargs) -> List[Task]
+    - 输入：query (str)、可选 kwargs
+    - 输出/返回：List[Task]
+    - 子类需实现同步版本
+  - ainvoke(query, **kwargs) -> List[Task]
+    - 输入：query (str)、可选 kwargs
+    - 输出/返回：List[Task]
+    - 子类可实现异步规划接口
+  - decompose_task(task: Task, **kwargs) -> List[Task]
+    - 用于将复杂任务拆分为子任务，子类实现。
+
+3. Context（位于 kag/interface/solver/context.py）
+- 说明：执行上下文，管理 Task 列表、生成 DAG，并按拓扑顺序产出可并行执行的任务组。
+- 关键方法：
+  - add_task(task: Task)
+    - 输入：Task
+    - 操作：把任务加入上下文内部映射
+  - append_task(task: Task)
+    - 输入：Task
+    - 操作：将任务追加为最近任务的后继（若无父则自动设置为 last 的子任务）
+  - get_dag() -> nx.DiGraph
+    - 输出：NetworkX 有向无环图（DAG）表示任务依赖
+    - 异常：若有引用不存在的任务 ID，会抛出 ValueError
+  - gen_task(group: bool = False)
+    - 输入：group 控制是否以并行分组生成
+    - 输出：生成器，group=False 时逐个 yield Task；group=True 时 yield 可并行执行的 Task 列表
+
+4. SolverPipelineABC 与具体 Pipeline（位于 kag/solver/pipeline/*）
+- 说明：SolverPipelineABC 定义求解器流水线接口；仓库中存在多种实现（index_pipeline、naive_rag_pipeline、mcp_pipeline、self_cognition_pipeline 等），它们共同遵循规划->执行->生成答案的流程。
+- 共同关键方法（在各 Pipeline 实现中出现）：
+  - planning(self, query, context, **kwargs) -> List[Task] 或 List[Task]（异步版本一般为 async）
+    - 功能：根据 query 生成初始任务 DAG
+  - execute_task(self, query, task, context, **kwargs)
+    - 功能：执行单个 Task（包括可能的 query 重写），并把结果写入 context
+  - ainvoke(self, query, **kwargs) -> answer
+    - 功能：编排整个流水线：planning -> 并行/分批执行 execute_task -> 通过 generator 生成最终答案
+
+5. ExecutorABC / GeneratorABC（接口定义）
+- ExecutorABC
+  - 说明：执行具体任务的抽象工具，通常包含 ainvoke(self, query, task, context, **kwargs)
+  - ainvoke 返回：通常通过修改 task.result 或 context 来传递执行结果
+- GeneratorABC
+  - 说明：负责从 context 中汇总并生成最终答案，接口通常为 ainvoke(self, query, context, **kwargs) -> str
+
+6. Task DAG 的构建与解析（相关模块）
+- static_planning_prompt.py
+  - parse_response(response) -> List[Task]
+    - 功能：将 LLM 返回的 JSON（或含 output 字段的 dict）解析为 Task 列表，内部调用 Task.create_tasks_from_dag
+    - 注意：会进行 JSON 解析及格式校验，格式不正确会抛出 ValueError
+- planner 在某些 Pipeline 中会直接返回硬编码或基于 LLM 的 tasks_dep，然后调用 Task.create_tasks_from_dag 或直接构造 Task
+
+7. knext Chain / Component（位于 knext/common/base/chain.py 与 component.py）
+- Chain 与 Component 用于构建本地处理 DAG（非任务调度层面的 Task DAG，但提供组件连接与数据流表达）：
+  - Component.__rshift__(other) -> Chain
+    - 支持把组件用 >> 操作符连接，返回新的 Chain（内部使用 networkx.DiGraph）
+  - Chain.__rshift__(other) -> Chain
+    - 支持把 Chain 或 Component 串联，合并 DAG
+  - Chain.invoke / batch
+    - invoke(input, max_workers, **kwargs) -> List[Output]
+    - 功能：按 DAG 拓扑并发执行组件，收集最终输出
+
+8. 异步任务管理（asyn_task_manager.py）
+- 说明：提供线程池 + 队列的异步任务提交与结果缓存逻辑，主要用于 web/server 场景的后台��务执行
+- 关键方法：
+  - submit_task(func, *args, **kwargs) -> str (task_id)
+  - get_task_result(task_id) -> dict (包含 status, result)
+  - shutdown()
+
+9. 与检索/生成/执行相关的数据容器
+- RetrieverOutput (kag/interface/solver/retriever_abc.py)
+  - fields: graphs, chunks, docs, retriever_method, summary, err_msg, task
+  - to_dict() -> dict
+- ReasonTask / TaskStreamRequest 等（自动生成的 REST 模型）用于服务端 API 交互
+
+附录：我在仓库中读取/依据的关键文件（非穷尽，供复查）
+- kag/interface/solver/planner_abc.py
+- kag/interface/solver/context.py
+- kag/solver/pipeline/mcp_pipeline.py
+- kag/solver/pipeline/naive_rag_pipeline.py
+- kag/solver/pipeline/index_pipeline.py
+- kag/solver/pipeline/self_cognition_pipeline.py
+- kag/solver/prompt/static_planning_prompt.py
+- knext/common/base/chain.py
+- knext/common/base/component.py
+- knext/common/base/runnable.py
+- kag/solver/server/asyn_task_manager.py
+- kag/interface/solver/retriever_abc.py
+
+若需我把该文档改为真正的 DOCX 二进制（可直接在 Word 打开）的格式，我可以在下一步把同样内容以 .docx 格式生成并提交；目前我已将简要文本版写入 docs/kag.docx（纯文本内容，扩展名为 .docx）。
