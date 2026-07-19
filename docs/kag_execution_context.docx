@@ -1,0 +1,192 @@
+KAG — 基于任务 DAG 生成任务执行上下文说明文档
+
+说明
+- 本文档列出在 kag 项目中“从任务 DAG 生成任务执行上下文（Context）”的相关类与关键函数。针对每个类，列出关键方法的签名、输入参数、输出/返回值与简要说明，便于开发者快速定位实现并使用。
+- 文档为可直接下载的说明文件（文本形式，文件名: docs/kag_execution_context.docx）。如需真正的 Word 二进制格式（.docx），我可以在下一步替换为 Word 文档。
+
+目录
+1. 概述
+2. 关键类一览
+3. 各类与关键函数说明
+4. 常见调用流程（示例）
+5. 注意事项
+
+1. 概述
+- 任务 DAG（task_dag）通常由 Planner（基于 LLM 或规则）生成，格式为字典：{"id": {"executor": ..., "dependent_task_ids": [...], "arguments": {...}}}。
+- 通过 Task.create_tasks_from_dag 将 DAG 解析为 Task 对象列表；通过 Context 把 Task 加入执行上下文并生成 NetworkX 的 DAG 表示，最后按拓扑或 generation（并行分组）产生执行顺序。
+
+2. 关键类一览（按功能分组）
+- 任务与规划
+  - Task (kag/interface/solver/planner_abc.py)
+  - PlannerABC (kag/interface/solver/planner_abc.py)
+- 执行上下文与调度
+  - Context (kag/interface/solver/context.py)
+- 求解流水线
+  - SolverPipelineABC + 具体实现（kag/solver/pipeline/index_pipeline.py, naive_rag_pipeline.py, mcp_pipeline.py, self_cognition_pipeline.py）
+- 执行器 / 生成器
+  - ExecutorABC, GeneratorABC (接口定义，kag/interface)
+- 辅助与运行时组件
+  - static_planning_prompt.parse_response (kag/solver/prompt/static_planning_prompt.py)
+  - knext Chain / Component (knext/common/base/chain.py, component.py)
+  - AsyncTaskManager（kag/solver/server/asyn_task_manager.py）
+  - RetrieverOutput (kag/interface/solver/retriever_abc.py)
+
+3. 各类与关键函数说明
+
+3.1 Task (kag/interface/solver/planner_abc.py)
+- 作用：表示一个可执行的任务单元，包含执行器名称、参数、父子关系、执行结果与内存等。
+- 关键字段：
+  - id: str — 任务唯一标识（可由外部指定或内部生成）
+  - executor: str — 执行此任务的执行器名称
+  - arguments: dict — 执行器参数
+  - parents: List[Task] — 父任务引用列表
+  - children: List[Task] — 子任务引用列表
+  - result: Any — 执行结果（执行器/流水线 填入）
+  - memory: dict — 可选的执行内存/中间态
+- 关键方法：
+  - create_tasks_from_dag(task_dag: Dict[str, dict]) -> List[Task]
+    - 输入：task_dag: dict — DAG 字典，每个节点需包含至少：executor, dependent_task_ids (list), arguments
+    - 输出/返回：List[Task] — Task 实例列表，且已建立 parent/child 关系
+    - 备注：若 task_dag 中的 dependent_task_ids 引用不存在的 ID，会在建立关系时抛出 KeyError / ValueError；调用方应在 Planner 解析阶段确保合法性或捕获并处理异常。
+  - add_parent(parent_task: Task)
+    - 输入：parent_task
+    - 返回：None — 建立父引用
+  - add_child(child_task: Task)
+    - 输入：child_task
+    - 返回：None — 建立子引用
+  - update_result(value: Any)
+    - 输入：value — 写回 task.result
+    - 返回：None
+  - update_memory(key: str, value: Any)
+    - 输入：key, value
+    - 返回：None
+
+3.2 PlannerABC (kag/interface/solver/planner_abc.py)
+- 作用：抽象的规划器基类，负责从用户 query 生成任务 DAG（Task 列表）或基于 LLM 的 JSON plan。
+- 关键属性/方法：
+  - input_types -> str
+  - output_types -> List[Task]
+  - invoke(query: str, **kwargs) -> List[Task]
+    - 输入：query (str), 可选其他上下文/参数
+    - 返回：List[Task]（同步实现，子类需覆盖）
+  - ainvoke(query: str, **kwargs) -> List[Task]
+    - 输入：query (str), 可选其他上下文/参数
+    - 返回：List[Task]（异步实现，子类可覆盖）
+  - decompose_task(task: Task, **kwargs) -> List[Task]
+    - 输入：一个复杂任务
+    - 返回：子任务列表（用于任务拆分的扩展点）
+
+3.3 Context (kag/interface/solver/context.py)
+- 作用：管理 Task 集合、构建依赖 DAG，并按拓扑/并行分组生成执行序列；对执行过程提供 task 查询/append/last_task 等工具。
+- 关键字段：
+  - _tasks: Dict[str, Task] — id -> Task 映射
+- 关键方法：
+  - add_task(task: Task) -> None
+    - 输入：Task
+    - 操作：把 Task 加入 _tasks 映射（若 id 冲突可能覆盖或报错，取决实现）
+  - append_task(task: Task) -> None
+    - 输入：Task
+    - 操作：如果 task 没有父，则自动把其 parent 设为当前 last_task（最后添加的任务），然后 add_task
+  - get_task(task_id: str) -> Optional[Task]
+    - 输入：task_id
+    - 返回：对应的 Task 或 None
+  - last_task() -> Optional[Task]
+    - 返回：最近加入的 Task（按内部顺序）
+  - get_dag() -> networkx.DiGraph
+    - 返回：基于当前 _tasks 的 NetworkX 有向图。构造逻辑：
+      - 节点：所有 task.id
+      - 边：对每个 task，向其 children 或 parents 添加边（parent.id -> task.id）
+    - 异常：若某个依赖引用了不存在的任务（如 parent id 不在 _tasks），会 raise ValueError("task X not found.")
+  - topological_sort(dag: nx.DiGraph) -> generator
+    - 输入：dag
+    - 返回：topological_sort generator
+  - topological_generations(dag: nx.DiGraph) -> generator
+    - 返回：按 generation 划分的节点集合（可并行执行的分组）
+  - gen_task(group: bool = False) -> generator
+    - 输入：group: bool
+    - 返回：如果 group=False，按拓扑顺序逐个 yield Task；如果 group=True，yield List[Task]（每组内任务可并行运行）
+
+3.4 SolverPipelineABC 及具体实现（kag/solver/pipeline/*.py）
+- 作用：高层求解流水线，负责 orchestration：planner -> execute tasks -> generator
+- 常见方法签名（各实现均出现）：
+  - planning(self, query: str, context: Context, **kwargs) -> List[Task]
+    - 说明：返回 tasks（可以直接返回 Task 列表或调用 Task.create_tasks_from_dag）
+  - execute_task(self, query: str, task: Task, context: Context, **kwargs) -> None
+    - 说明：选择 executor（select_executor）并调用其 ainvoke，或在内部进行 query 重写，然后把结果写入 task/result 或 context
+  - ainvoke(self, query: str, **kwargs) -> Any
+    - 说明：整体异步执行流程（planning -> 把 tasks 加入 context -> 按 gen_task 并行/分批执行 execute_task -> 调用 generator 生成最终答案），返回最终 answer
+- 示例：
+  - IndexPipeline.planning 返回 [Task(executor="Retriever", arguments={"query": query})]
+  - NaiveRAGPipeline.planning 返回硬编码的 tasks_dep 并调用 Task.create_tasks_from_dag
+  - MCPPipeline 使用 planner.ainvoke 生成 tasks（LLM 规划），然后按 generations 并行执行
+
+3.5 ExecutorABC / GeneratorABC（接口）
+- ExecutorABC
+  - 关键方法：ainvoke(self, query: str, task: Task, context: Context, **kwargs) -> Any
+    - 说明：执行 task，通常会把执行结果写回 task.update_result(...) 或 context
+- GeneratorABC
+  - 关键方法：ainvoke(self, query: str, context: Context, **kwargs) -> str
+    - 说明：从 context 收集执行结果并合成最终答案（字符串或结构化结果）
+
+3.6 static_planning_prompt.parse_response (kag/solver/prompt/static_planning_prompt.py)
+- 函数：parse_response(response: Union[str, dict], **kwargs) -> List[Task]
+  - 输入：response — LLM 的字符串或已解析的 dict
+  - 操作：尝试 json.loads(response)（若为字符串），取 response.get("output", response) 作为核心 DAG 数据，校验为 dict 后调用 Task.create_tasks_from_dag
+  - 返回：List[Task]
+  - 异常：若解析失败或格式不符抛 ValueError（包含错误信息，便于诊断）
+
+3.7 knext Chain / Component（knext/common/base/chain.py, component.py）
+- 用途：用于构建本地数据处理 DAG（组件间的数据流），和 Task/Context 层的任务 DAG 属于不同层次，但其 DAG 合并/连接与执行模型相似，值得参考：
+  - Component.__rshift__(other) -> Chain
+    - 支持把组件或 chain 连接起来，内部使用 networkx.DiGraph，添加节点与边
+  - Chain.__rshift__(other) -> Chain
+    - 合并 dag（nx.compose 或 nx.compose_all），并返回 Chain(dag=final_dag)
+  - Chain.invoke(input, max_workers, **kwargs) -> List[Output]
+    - 说明：按 DAG 的拓扑并发执行组件（内部用线程池 executor.submit），收集并返回输出节点的输出
+
+3.8 异步任务管理：AsyncTaskManager（kag/solver/server/asyn_task_manager.py）
+- 功能：提供服务端后台任务队列、工作线程池、结果缓存与查询接口
+- 关键方法：
+  - submit_task(func: Callable, *args, **kwargs) -> str (task_id)
+    - 把任务放入 queue，返回生成的 UUID 作为 task_id
+  - get_task_result(task_id: str) -> dict
+    - 返回缓存中的 {"task_id":..., "status":"running/completed/failed", "result":...}
+  - shutdown() -> None
+
+3.9 RetrieverOutput (kag/interface/solver/retriever_abc.py)
+- 数据容器，用于统一检索器输出格式
+- 字段：graphs, chunks, docs, retriever_method, summary, err_msg, task
+- 方法：to_dict() -> dict
+
+4. 常见调用流程（示例，伪代码）
+- Input: task_dag (dict)
+1) tasks = Task.create_tasks_from_dag(task_dag)
+2) ctx = Context()
+   for t in tasks:
+       ctx.add_task(t)
+3) dag = ctx.get_dag()  # networkx.DiGraph
+4) for task_group in ctx.gen_task(group=True):
+       并行执行 task_group（每个 task 调用相应 executor 的 ainvoke）
+5) answer = generator.ainvoke(query, ctx)
+
+5. 注意事项
+- DAG 格式校验：在 LLM 规划器输出解析阶段务必校验 DAG 格式（executor 字段存在，dependent_task_ids 为列表，arguments 为 dict），static_planning_prompt.parse_response 已做基础校验。
+- 循环依赖：Context.get_dag 会在 topological_sort 时抛出 NetworkXUnfeasible（含环），应在规划端重试或降级处理。
+- 并发安全：在并行执行組别时，若执行器会修改共享状态（全局缓存、外部 DB），需保证线程/协程安全。
+- 错误恢复：推荐使用 checkpoint 或任务重试机制（例如 tenacity 重试装饰器），并把异常或失败状态写入 task.memory/task.result 以便跟踪。
+
+附录：仓库参考文件
+- kag/interface/solver/planner_abc.py
+- kag/interface/solver/context.py
+- kag/solver/pipeline/index_pipeline.py
+- kag/solver/pipeline/naive_rag_pipeline.py
+- kag/solver/pipeline/mcp_pipeline.py
+- kag/solver/pipeline/self_cognition_pipeline.py
+- kag/solver/prompt/static_planning_prompt.py
+- knext/common/base/chain.py
+- knext/common/base/component.py
+- knext/common/base/runnable.py
+- kag/solver/server/asyn_task_manager.py
+- kag/interface/solver/retriever_abc.py
+
+结束。
